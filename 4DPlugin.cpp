@@ -54,13 +54,14 @@ void CommandDispatcher (PA_long32 pProcNum, sLONG_PTR *pResult, PackagePtr pPara
     CGFloat blue;
     CGFloat alpha;
     BOOL running;
-    id target;
-    SEL action;
+    BOOL savedShowsAlpha;
+    NSString *savedTitle;
 }
 - (id)initWithRed:(CGFloat)red green:(CGFloat)green blue:(CGFloat)blue alpha:(CGFloat)alpha title:(NSString *)title showsAlpha:(BOOL)showsAlpha;
 - (void)dealloc;
-- (void)pickerWillClose:(id)sender;
+- (void)panelWillClose:(NSNotification *)notification;
 - (void)colorDidChange:(NSNotification *)notification;
+- (void)restorePanel;
 - (BOOL)isRunning;
 - (void)getRed:(CGFloat *)red green:(CGFloat *)green blue:(CGFloat *)blue alpha:(CGFloat *)alpha;
 @end
@@ -77,6 +78,10 @@ void CommandDispatcher (PA_long32 pProcNum, sLONG_PTR *pResult, PackagePtr pPara
     
     NSColorPanel *sharedColorPanel = [NSColorPanel sharedColorPanel];
     
+    //remember the panel state, to avoid side effects on the Select RGB color command
+    savedShowsAlpha = sharedColorPanel.showsAlpha;
+    savedTitle = [sharedColorPanel.title copy];
+    
     sharedColorPanel.showsAlpha = showsAlpha;
     sharedColorPanel.title = title;
     sharedColorPanel.color = [NSColor colorWithCalibratedRed:red green:green blue:blue alpha:alpha];
@@ -87,13 +92,12 @@ void CommandDispatcher (PA_long32 pProcNum, sLONG_PTR *pResult, PackagePtr pPara
      name:NSColorPanelColorDidChangeNotification
      object:sharedColorPanel];
     
-     NSButton *closeButton = [[NSColorPanel sharedColorPanel] standardWindowButton:NSWindowCloseButton];
-    
-    target = closeButton.target;
-    action = closeButton.action;
-    
-    [closeButton setTarget:self];
-    [closeButton setAction:@selector(pickerWillClose:)];
+    //catch every way the panel can close (close button, esc, cmd-w, another process)
+    [[NSNotificationCenter defaultCenter]
+     addObserver:self
+     selector:@selector(panelWillClose:)
+     name:NSWindowWillCloseNotification
+     object:sharedColorPanel];
 
     running = YES;
 
@@ -107,24 +111,30 @@ void CommandDispatcher (PA_long32 pProcNum, sLONG_PTR *pResult, PackagePtr pPara
 - (void)dealloc
 {
     [[NSNotificationCenter defaultCenter]removeObserver:self];
-    
-    NSColorPanel *sharedColorPanel = [NSColorPanel sharedColorPanel];
-    NSButton *closeButton = [sharedColorPanel standardWindowButton:NSWindowCloseButton];
-    //restore original, to avoid conflict with Select RGB color command
-    [closeButton setTarget:target];
-    [closeButton setAction:action];
+    [savedTitle release];
     
     [super dealloc];
 }
 - (void)colorDidChange:(NSNotification *)notification
 {
     NSColorPanel *sharedColorPanel = [NSColorPanel sharedColorPanel];
-    NSColor *color = [sharedColorPanel color];
-    [color getRed:&red green:&green blue:&blue alpha:&alpha];
+    //getRed:green:blue:alpha: raises for gray, cmyk, catalog and pattern colors;
+    //convert to the same color space as colorWithCalibratedRed:green:blue:alpha:
+    NSColor *color = [[sharedColorPanel color]colorUsingColorSpace:[NSColorSpace genericRGBColorSpace]];
+    if(color)
+    {
+        [color getRed:&red green:&green blue:&blue alpha:&alpha];
+    }
 }
-- (void)pickerWillClose:(id)sender
+- (void)panelWillClose:(NSNotification *)notification
 {
     running = NO;
+}
+- (void)restorePanel
+{
+    NSColorPanel *sharedColorPanel = [NSColorPanel sharedColorPanel];
+    sharedColorPanel.showsAlpha = savedShowsAlpha;
+    if(savedTitle) sharedColorPanel.title = savedTitle;
 }
 - (BOOL)isRunning
 {
@@ -151,15 +161,35 @@ namespace ColorPicker
         CGFloat alpha;
         Listener *listener;
     }Params;
-    void Close()
+    
+    //the color panel is shared; only one call may use it at a time
+    static BOOL isBusy = NO;
+    
+    //reset the flag even if an exception unwinds the command
+    struct BusyGuard
     {
-        NSColorPanel *sharedColorPanel = [NSColorPanel sharedColorPanel];
-        [sharedColorPanel close];
+        BusyGuard() { isBusy = YES; }
+        ~BusyGuard() { isBusy = NO; }
+    };
+    
+    void Close(ColorPicker::Params *params)
+    {
+        @autoreleasepool
+        {
+            //stop observing first, so that closing does not notify the listener
+            [[NSNotificationCenter defaultCenter]removeObserver:params->listener];
+            NSColorPanel *sharedColorPanel = [NSColorPanel sharedColorPanel];
+            [sharedColorPanel close];
+            [params->listener restorePanel];
+        }
     }
     void Open(ColorPicker::Params *params){
         
-        params->listener = [[Listener alloc]initWithRed:params->red green:params->green blue:params->blue alpha:params->alpha
-        title:params->title showsAlpha:params->showsAlpha];
+        @autoreleasepool
+        {
+            params->listener = [[Listener alloc]initWithRed:params->red green:params->green blue:params->blue alpha:params->alpha
+            title:params->title showsAlpha:params->showsAlpha];
+        }
     }
     void ConvertToStandardColor(CGFloat *red, CGFloat *green, CGFloat *blue, CGFloat *alpha)
     {
@@ -177,6 +207,14 @@ namespace ColorPicker
         tempColor = [tempColor colorUsingColorSpace:[NSColorSpace genericRGBColorSpace]];
         [tempColor getRed:red green:green blue:blue alpha:alpha];
     }
+    NSUInteger ComponentToByte(CGFloat value)
+    {
+        //clamp, casting a negative or large float to an unsigned integer is undefined
+        if(!(value > 0.0f)) return 0;
+        if(value >= 1.0f) return 0xFF;
+        //https://developer.apple.com/library/mac/qa/qa1576/_index.html
+        return (NSUInteger)(value * 255.99999f);
+    }
 }
 
 void Mac_Select_RGB_color(sLONG_PTR *pResult, PackagePtr pParams)
@@ -191,6 +229,19 @@ void Mac_Select_RGB_color(sLONG_PTR *pResult, PackagePtr pParams)
 	Param3.fromParamAtIndex(pParams, 3);
 
 	NSUInteger color = Param1.getIntValue();
+    
+    //no user interface on the server, or panel already in use: return the color unchanged
+    if(PA_Is4DServer() || ColorPicker::isBusy)
+    {
+        returnValue.setIntValue(Param1.getIntValue());
+        returnValue.setReturn(pResult);
+        return;
+    }
+    
+    ColorPicker::BusyGuard busyGuard;
+    
+    @autoreleasepool
+    {
     NSString *title = Param2.copyUTF16String();
     NSUInteger flags = Param3.getIntValue();
     
@@ -208,7 +259,7 @@ void Mac_Select_RGB_color(sLONG_PTR *pResult, PackagePtr pParams)
         ColorPicker::ConvertToDeviceColor(&red, &green, &blue, &alpha);
     }
     
-    ColorPicker::Params params;
+    ColorPicker::Params params = {};
     
     params.showsAlpha   = showsAlpha;
     params.alpha        = showsAlpha ? alpha : 1.0f;
@@ -219,34 +270,39 @@ void Mac_Select_RGB_color(sLONG_PTR *pResult, PackagePtr pParams)
     
     PA_RunInMainProcess((PA_RunInMainProcessProcPtr)ColorPicker::Open, &params);
     
-    while([params.listener isRunning] && !PA_IsProcessDying())
-    { 
-        PA_YieldAbsolute();
+    if(params.listener)
+    {
+        PA_long32 currentProcess = PA_GetCurrentProcessNumber();
+        
+        while([params.listener isRunning] && !PA_IsProcessDying())
+        {
+            //sleep a couple of ticks instead of spinning
+            PA_PutProcessToSleep(currentProcess, 2);
+        }
+        
+        PA_RunInMainProcess((PA_RunInMainProcessProcPtr)ColorPicker::Close, &params);
+        
+        [params.listener getRed:&red green:&green blue:&blue alpha:&alpha];
+        
+        [params.listener release];
     }
-    
-    PA_RunInMainProcess((PA_RunInMainProcessProcPtr)ColorPicker::Close, NULL);
-    
-    [params.listener getRed:&red green:&green blue:&blue alpha:&alpha];
-    
-    [params.listener release];
     
     if(useStandardColorSpace){
         ColorPicker::ConvertToStandardColor(&red, &green, &blue, &alpha);
     }
     
-    //https://developer.apple.com/library/mac/qa/qa1576/_index.html
-    
-    color = params.showsAlpha ? ((NSUInteger)(alpha * 255.99999f) << 24) : 0;
+    color = params.showsAlpha ? (ColorPicker::ComponentToByte(alpha) << 24) : 0;
     
     color = color
-        +((NSUInteger)(red      * 255.99999f) << 16)
-        +((NSUInteger)(green    * 255.99999f) << 8)
-        + (NSUInteger)(blue     * 255.99999f);
+        +(ColorPicker::ComponentToByte(red)      << 16)
+        +(ColorPicker::ComponentToByte(green)    << 8)
+        + ColorPicker::ComponentToByte(blue);
     
-    returnValue.setIntValue(color);
+    returnValue.setIntValue((int)color);
 	returnValue.setReturn(pResult);
     
     [title release];
+    }
 }
 
 #pragma mark -
