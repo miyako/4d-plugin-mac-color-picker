@@ -1,0 +1,26 @@
+// Fixed source-version fixture: three project configurations.
+{
+    objects = {
+        Development = {
+            buildSettings = {
+                MARKETING_VERSION = 1.2.3;
+                CURRENT_PROJECT_VERSION = 1.2.3;
+                MACOSX_DEPLOYMENT_TARGET = 11.5;
+            };
+        };
+        Deployment = {
+            buildSettings = {
+                MARKETING_VERSION = 1.2.3;
+                CURRENT_PROJECT_VERSION = 1.2.3;
+                MACOSX_DEPLOYMENT_TARGET = 11.5;
+            };
+        };
+        Default = {
+            buildSettings = {
+                MARKETING_VERSION = 1.2.3;
+                CURRENT_PROJECT_VERSION = 1.2.3;
+                MACOSX_DEPLOYMENT_TARGET = 11.5;
+            };
+        };
+    };
+}

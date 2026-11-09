@@ -1,1 +1,5 @@
-﻿/* Localized versions of Info.plist keys */CFBundleName = "Mac Color Picker";CFBundleShortVersionString = "1.0";CFBundleGetInfoString = "Mac Color Picker version 1.0, Copyright 2015 miyako.";
+﻿/* Localized versions of Info.plist keys */
+
+CFBundleName = "Mac Color Picker";
+CFBundleShortVersionString = "1.0.1";
+CFBundleGetInfoString = "Mac Color Picker version 1.0.1, Copyright 2015 miyako.";
