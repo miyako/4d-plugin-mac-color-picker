@@ -1,0 +1,30 @@
+name: Native ownership
+
+on:
+  push:
+    paths:
+      - '4D Plugin API/**'
+      - '.github/tests/ownership_host.mm'
+      - '.github/tests/test_ownership.py'
+      - '.github/tests/platform/**'
+      - '.github/workflows/ownership.yml'
+  pull_request:
+    paths:
+      - '4D Plugin API/**'
+      - '.github/tests/ownership_host.mm'
+      - '.github/tests/test_ownership.py'
+      - '.github/tests/platform/**'
+      - '.github/workflows/ownership.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  ownership:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Unsigned isolated source differential
+        run: python3 .github/tests/test_ownership.py --compare-baseline

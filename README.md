@@ -43,8 +43,10 @@ The conversion is OK but the panel is not modal to the window that invoked it.
 
 Release workflow
 ---
-Releases use source metadata, not a pre-existing tag. Both Actions workflows
-are manual; pushing commits or tags does not start a build.
+Releases use source metadata, not a pre-existing tag. Both release-related Actions
+workflows are manual; pushing commits or tags does not start a release build.
+The separate **Native ownership** workflow runs unsigned, isolated source tests
+on relevant pushes and pull requests; it never packages or publishes the plugin.
 
 1. Run **Bump version** on the explicitly selected branch with `patch`, `minor`
    or `major`. It validates the selected commit, clean checkout and remote branch,
@@ -94,7 +96,7 @@ not increment the release version or introduce an independent build counter.
 The localization's copyright and UTF-8 BOM are preserved, with CR line endings
 normalized to LF.
 
-Local regression checks (no native build, signing or publication):
+Local regression checks (no plugin build, signing or publication):
 
 ```sh
 python3 .github/scripts/source_version.py
@@ -107,3 +109,96 @@ reference handling, pagination failures and drafts, retained partial publication
 and real temporary bare-Git branch/tag races. Helpers and race regressions are
 adapted from reviewed `miyako/4d-plugin-script#1` at
 `4cdf7b5d4ec645385654e6cb17a2ff0603925fb5`.
+
+Native string ownership audit
+---
+Baseline: `f54c69fc0de98cfb6930009c138ffc447faaf7cd`. Guidance:
+[`miyako/skills` at `e6b492fcb81e5e1a7f7db723594b420e63bf6eb9`](https://github.com/miyako/skills/blob/e6b492fcb81e5e1a7f7db723594b420e63bf6eb9/4d-skills/skills/4dplugin/SKILL.md).
+The following inventory covers all 42 tracked native source/header/prefix files,
+including compiled helpers not called by the current command.
+
+| Files (relative to repository root) | Reachability and ownership findings |
+|---|---|
+| `4DPlugin.cpp`, `4DPlugin.h` | SDK `FourDPackex` calls `PluginMain`, then `CommandDispatcher`. Init/server-init select `OnStartup`; command 1 selects `Mac_Select_RGB_color`. The root and bundled `manifest.json` declare `(&L;&T;&L):L`, not arrays. `C_TEXT` copies the borrowed title; `copyUTF16String` creates an owned Foundation title released after synchronous main-process callbacks. Listener copies/releases the saved panel title. UI/exception behavior is static-inspection-only, not host-certified. |
+| `4D Plugin API/4DPluginAPI.c`, `4DPluginAPI.h`, `PublicTypes.h`, `PrivateTypes.h`, `EntryPoints.h`, `Flags.h` | Complete unchanged bundled SDK and its include graph. `4DPluginAPI.h` includes all wrapper headers. Engine source last changed in `d982ac66cb3219c7885692d1fb018b98d7ffa1de`; its v14 comment and header's v13 comment are not verified upstream SDK identities. |
+| `4D Plugin API/Classes/C_TEXT.{h,cpp}` | Independent `std::basic_string` copies of borrowed parameter/descriptor contents; engine-backed scalar content setters and Foundation/CF create-copy/release paths. No array transfer cleanup added. |
+| `4D Plugin API/Classes/ARRAY_TEXT.{h,cpp}` | Copies borrowed elements into independent C++ strings before replacement/shrink/clear. Each output creates its own descriptor and transfers it without post-transfer disposal. Normal destinations and exact rejection predicates are covered; OOM limitations below remain. |
+| `4D Plugin API/Classes/C_PICTURE.{h,cpp}` | Compiled dormant helper family: fixed path double disposal and initial empty string leak, retain-before-output-clear, `setBytes` temporary release, overwritten empty picture/string owners, and converter bytes/code-units mismatch. Borrowed `getSize`/thumbnail inputs still detach before clear; owning copy/grayscale/thumbnail results detach and survive caller cleanup. No invented owning procedure return. |
+| `4D Plugin API/Classes/C_POINTER.{h,cpp}` | Metadata/variable-definition union copying, no direct string descriptor disposal. `PA_GetPointerValue` forwards to the engine; interpretation of returned definition metadata and cleanup requires host evidence, so no speculative clear/relabel patch. |
+| `4D Plugin API/Classes/C_BLOB.{h,cpp}` | `CBytes`/`C_BLOB` own vectors, borrow/produce handles, and convert hex/base64 through `C_TEXT`; no shallow `PA_Unistring` assignment. Nonstring buffer/allocation issues are outside this bounded fix. |
+| `4D Plugin API/Classes/C_DATE.{h,cpp}`, `C_INTEGER.{h,cpp}`, `C_LONGINT.{h,cpp}`, `C_REAL.{h,cpp}`, `C_TIME.{h,cpp}` | Value-only parameter/return wrappers; date, numeric and time operations do not create or adopt string descriptors. |
+| `4D Plugin API/Classes/ARRAY_BOOLEAN.{h,cpp}`, `ARRAY_DATE.{h,cpp}`, `ARRAY_INTEGER.{h,cpp}`, `ARRAY_LONGINT.{h,cpp}`, `ARRAY_REAL.{h,cpp}`, `ARRAY_TIME.{h,cpp}` | Numeric/date/bit-array value copies; shared SDK allocation/resize boundaries inspected, not certified for OOM. |
+| `4D Plugin API/Classes/C_TYPES.h`, `4D Plugin_Prefix.pch` | Standard string/vector typedefs, Foundation/AppKit/platform includes and Carbon prefix. Test-only platform headers replace Cocoa/AppKit before compilation. |
+
+Both `Mac Color Picker.xcodeproj/project.pbxproj` and
+`Mac Color Picker.vcxproj` list the 16 helper implementations and plugin entry
+source; the Windows project also explicitly compiles the SDK engine, while the
+Xcode project compiles the engine through its build phase. The Windows `.def`
+exports `FourDPackex`. No alternative first-party native implementation or
+JSON/property/collection wrapper is present in this tracked inventory. The
+prebuilt bundle/database are not source reachability evidence and are untouched.
+
+**Verified local SDK contracts:** engine git blob
+`478081f0238f6bc5393222f574bc2656f010b67b`, SHA-256
+`355ee208ad6c61dcc68e8432546fc42484888211dd07ed8fa3fdb4440f3edbd8`.
+The driver pins all six SDK source/header hashes. `PA_SetStringInArray`
+(engine lines 4444-4459) disposes the old element and shallow-transfers only for
+Unicode array kind, non-null array handle, non-null input, and
+`0 <= index <= fNbElements`. Index zero is accepted. Rejection leaves the
+input caller-owned; `PA_GetStringInArray` is borrowed.
+`PA_SetStringVariable`/`PA_SetPictureVariable` shallow-assign without releasing
+old contents; creating `Unistring`/`Picture` variables first allocates empty
+owners. Use `Undefined` only for immediately overwritten destinations.
+`PA_ClearVariable` forwards owning cleanup to the engine.
+`PA_ReturnString`/`PA_SetUnistring` use a distinct engine content setter.
+`PA_DuplicatePicture(..., 1)` retains; output parameter retention precedes
+clearing its original owner. `PA_ConvertCharsetToCharset` explicitly returns
+bytes, not UTF-16 code units (lines 4775-4793).
+
+**Regression:** on macOS, run:
+
+```sh
+python3 .github/tests/test_ownership.py --compare-baseline
+```
+
+The same final harness compiles the actual 16 wrapper implementations and
+complete, unmodified SDK twice: current production sources, and the exact
+baseline extracted with `git archive` (not a checkout/session). It records the
+compiled picture source hash. The reference harness/driver were imported from
+[`miyako/4d-plugin-jpegoptim` at `e49adcd32bd5500cf3de680faa3649b32463ff5e`](https://github.com/miyako/4d-plugin-jpegoptim/tree/e49adcd32bd5500cf3de680faa3649b32463ff5e/.github/tests)
+and independently adapted to this target's verified SDK.
+
+There are 35 runtime cases across 11 test methods. Baseline has 21 exact,
+named expected failures and 14 passing controls; fixed sources pass all 35.
+Failures are path duplicate/unowned string disposal (8), incorrect retained
+output count (2), converter ASan heap-buffer-overflow (1), leaked initial string
+owners (2), and unbalanced picture references (8).
+Cases cover allocated/null empty strings, ASCII/BMP/supplementary text, exact
+UTF-8 content and UTF-16 lengths/capacity/termination, replacement/shrink/clear,
+rejected transfers, independent scalar/callback allocations, borrowed input
+copies, Foundation title copies, output handoff survival, poisoned failed
+picture-data getter outputs, and command argument-handle allocation failure.
+The latter confirms the SDK's raw-kind-zero command failure sentinel versus
+the method's `Undefined` result; production helpers neither adopt nor clear
+an invented procedure result.
+
+ASan and UBSan run with explicit string/handle/picture reference counts
+(`strings=0 pictures=0 handles=0` for every passing case). LeakSanitizer is
+unavailable on this macOS target; UBSan alignment checking is disabled for the
+SDK's packed ABI. The test binary links Foundation/CoreGraphics, not
+Cocoa/AppKit (checked with `otool`). Fake `NSImage` methods abort; every
+unrecognized engine selector aborts. The real dispatcher, startup,
+color picker, screen conversion, filesystem picture loading, UI/event loop,
+preferences, clipboard and devices are never executed. Synthetic picture
+procedures operate solely on in-memory reference-counted tokens.
+
+**Deferred, not certified:** initial `PA_CreateUnistring` failure has no
+established wrapper error channel; its SDK forwarding does not itself validate
+the returned descriptor. No fallback or success-shaped replacement is added.
+Array creation/reallocation failure and SDK resize-count corruption remain
+unfixed; ordinary-array tests do not establish OOM safety. Nonstring/CBytes
+allocation failures, successful SDK-only `PA_GetPictureData` string ownership,
+application-path/localization strings and pointer metadata ownership require
+separate engine/host evidence. No Windows, real-4D, UI or exception-path
+certification is implied. SDK files, native projects, manifests, release
+workflows, prebuilt binaries and their modes remain unchanged.
